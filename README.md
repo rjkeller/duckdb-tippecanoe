@@ -56,9 +56,28 @@ itself.
 
 ## Building
 
+None of the build dependencies are tracked here, so fetch them first:
+
 ```sh
 git clone --depth 1 --branch v1.5.5 https://github.com/duckdb/duckdb.git
 git clone --depth 1 https://github.com/duckdb/extension-ci-tools.git
+
+# The patched tippecanoe. Its tcbf.hpp is on the extension's include path, so
+# this is a build dependency and not only a runtime one.
+git clone --depth 1 --branch duckdb-tcbf \
+	https://github.com/rjkeller/tippecanoe.git third_party/tippecanoe
+
+# The SQLite amalgamation, compiled into the extension to read .mbtiles.
+mkdir -p third_party/sqlite3
+curl -O https://sqlite.org/2024/sqlite-amalgamation-3460100.zip
+unzip -j sqlite-amalgamation-3460100.zip \
+	'sqlite-amalgamation-3460100/sqlite3.[ch]' -d third_party/sqlite3
+rm sqlite-amalgamation-3460100.zip
+```
+
+Then build:
+
+```sh
 GEN=ninja CMAKE_BUILD_PARALLEL_LEVEL=18 make release
 ```
 
@@ -278,17 +297,20 @@ validating and querying what actually ended up in the tiles.
 
 ## Performance
 
-`third_party/tippecanoe` vendors tippecanoe v2.80.0 with performance patches
-that profiling this extension motivated: tile writes are batched into SQLite
-transactions with cached prepared statements, the largest tiling tasks really
-are scheduled first (upstream's largest-first sort compared pointers rather
-than task sizes), and the short-lived temporary shard files that carry
-features between zoom levels are written uncompressed — compressing them was
-most of the single-threaded time at low zoom levels, where few tiles exist
-and tippecanoe's per-tile parallelism has nothing to spread across.
+The tippecanoe cloned above ([rjkeller/tippecanoe][fork], branch
+`duckdb-tcbf`) is v2.80.0 with performance patches that profiling this
+extension motivated: tile writes are batched into SQLite transactions with
+cached prepared statements, the largest tiling tasks really are scheduled
+first (upstream's largest-first sort compared pointers rather than task
+sizes), and the short-lived temporary shard files that carry features
+between zoom levels are written uncompressed — compressing them was most of
+the single-threaded time at low zoom levels, where few tiles exist and
+tippecanoe's per-tile parallelism has nothing to spread across.
 
-Build the vendored copy and either put it on your PATH or select it per
-query with the `TIPPECANOE` option:
+[fork]: https://github.com/rjkeller/tippecanoe/tree/duckdb-tcbf
+
+Build it and either put it on your PATH or select it per query with the
+`TIPPECANOE` option:
 
 ```sh
 make -C third_party/tippecanoe -j tippecanoe
