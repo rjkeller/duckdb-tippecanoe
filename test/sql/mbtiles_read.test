@@ -1,0 +1,226 @@
+# name: test/sql/mbtiles_read.test
+# description: Reading .mbtiles back into rows
+# group: [tippecanoe]
+
+require tippecanoe
+
+statement ok
+PRAGMA enable_verification
+
+# Build a tileset to read back. A high maximum zoom keeps tile quantization
+# well below the precision these tests compare at.
+
+statement ok
+CREATE TABLE places AS SELECT * FROM (VALUES
+    ('POINT(5.5 6.25)'::GEOMETRY, 'alpha', 10),
+    ('POINT(5.6 6.35)'::GEOMETRY, 'beta',  20)
+) t(geom, label, score);
+
+statement ok
+COPY places TO '__TEST_DIR__/rt.mbtiles' (FORMAT mbtiles, LAYER 'places', MINZOOM 12, MAXZOOM 14);
+
+# The schema is derived from the tileset's own metadata, so the attributes
+# come back as real columns rather than a blob of JSON.
+
+query I
+SELECT column_name FROM (DESCRIBE SELECT * FROM '__TEST_DIR__/rt.mbtiles');
+----
+geom
+layer
+zoom
+tile_x
+tile_y
+feature_id
+label
+score
+
+# A bare path works through the replacement scan, and defaults to the maximum
+# zoom - the only level where every feature is guaranteed present.
+#
+# Reading a tileset is not the same as reading the source table. tippecanoe
+# buffers each tile so that features near an edge are duplicated into the
+# neighbouring tile, so a feature can come back more than once. Deduplicate on
+# an attribute, or on (feature_id), when you want one row per source feature.
+
+query III
+SELECT layer, zoom, count(DISTINCT label) FROM '__TEST_DIR__/rt.mbtiles' GROUP BY 1, 2;
+----
+places	14	2
+
+# The duplication is real and worth pinning down: these two points land in
+# different tiles, and one of them falls inside the other tile's buffer.
+
+query I
+SELECT count(*) > count(DISTINCT label) FROM '__TEST_DIR__/rt.mbtiles';
+----
+true
+
+# A duplicated feature carries the same coordinates in both tiles, so the
+# geometry is identical rather than merely similar.
+
+query IIII
+SELECT DISTINCT label, score,
+       round(regexp_extract(st_astext(geom), '(-?[0-9]+\.?[0-9]*) ', 1)::DOUBLE, 3) AS lon,
+       round(regexp_extract(st_astext(geom), ' (-?[0-9]+\.?[0-9]*)', 1)::DOUBLE, 3) AS lat
+FROM '__TEST_DIR__/rt.mbtiles' ORDER BY label;
+----
+alpha	10.0	5.5	6.25
+beta	20.0	5.6	6.35
+
+# The zoom parameter selects a specific level.
+
+query II
+SELECT zoom, count(DISTINCT label) FROM read_mbtiles('__TEST_DIR__/rt.mbtiles', zoom := 12) GROUP BY 1;
+----
+12	2
+
+# The layer parameter filters, and a name that matches nothing yields no rows.
+
+query I
+SELECT count(DISTINCT label) FROM read_mbtiles('__TEST_DIR__/rt.mbtiles', layer := 'places');
+----
+2
+
+query I
+SELECT count(*) FROM read_mbtiles('__TEST_DIR__/rt.mbtiles', layer := 'nope');
+----
+0
+
+# Polygons come back as polygons, including the ring closure WKB requires but
+# MVT leaves implicit. A polygon larger than one tile is stored as a clipped
+# piece per tile, so this arrives as many rows rather than one.
+
+statement ok
+COPY (SELECT 'POLYGON((1 1, 1.5 1, 1.5 1.5, 1 1.5, 1 1))'::GEOMETRY AS geom, 'square' AS kind)
+    TO '__TEST_DIR__/poly.mbtiles' (FORMAT mbtiles, LAYER 'shapes', MINZOOM 8, MAXZOOM 9);
+
+query II
+SELECT DISTINCT kind, regexp_extract(st_astext(geom), '^([A-Z]+)', 1) AS geometry_type
+FROM '__TEST_DIR__/poly.mbtiles';
+----
+square	POLYGON
+
+# Every piece is a closed ring: WKT repeats the first vertex at the end.
+
+query I
+SELECT bool_and(
+    regexp_extract(st_astext(geom), '\(\((.*?),') IS NOT NULL
+) FROM '__TEST_DIR__/poly.mbtiles';
+----
+true
+
+# Raw tile access exposes the stored tiles, already converted from the TMS row
+# numbering .mbtiles uses to the XYZ addressing everything else expects.
+
+query I
+SELECT count(*) > 0 FROM read_mbtiles_tiles('__TEST_DIR__/rt.mbtiles');
+----
+true
+
+# The addresses raw tiles report line up with the ones features carry.
+
+query I
+SELECT count(*) = 0 FROM (
+    SELECT DISTINCT zoom, tile_x, tile_y FROM read_mbtiles('__TEST_DIR__/rt.mbtiles')
+    EXCEPT
+    SELECT zoom, tile_x, tile_y FROM read_mbtiles_tiles('__TEST_DIR__/rt.mbtiles')
+);
+----
+true
+
+# PMTiles is written by the same code path - tippecanoe picks the container
+# from the output file name - and read by a completely separate one, since the
+# archive format shares nothing with SQLite.
+
+statement ok
+COPY places TO '__TEST_DIR__/rt.pmtiles' (FORMAT pmtiles, LAYER 'places', MINZOOM 12, MAXZOOM 14);
+
+query I
+SELECT content[1:7] FROM read_blob('__TEST_DIR__/rt.pmtiles');
+----
+PMTiles
+
+# The bare path works for .pmtiles too, with the same derived schema.
+
+query I
+SELECT column_name FROM (DESCRIBE SELECT * FROM '__TEST_DIR__/rt.pmtiles');
+----
+geom
+layer
+zoom
+tile_x
+tile_y
+feature_id
+label
+score
+
+query IIII
+SELECT DISTINCT label, score,
+       round(regexp_extract(st_astext(geom), '(-?[0-9]+\.?[0-9]*) ', 1)::DOUBLE, 3) AS lon,
+       round(regexp_extract(st_astext(geom), ' (-?[0-9]+\.?[0-9]*)', 1)::DOUBLE, 3) AS lat
+FROM '__TEST_DIR__/rt.pmtiles' ORDER BY label;
+----
+alpha	10.0	5.5	6.25
+beta	20.0	5.6	6.35
+
+# The two containers hold the same tileset, so the two readers - which share
+# only the MVT decoder - must agree exactly, geometry included.
+
+query I
+SELECT count(*) = 0 FROM (
+    SELECT label, score, zoom, tile_x, tile_y, st_astext(geom) AS g FROM '__TEST_DIR__/rt.mbtiles'
+    EXCEPT
+    SELECT label, score, zoom, tile_x, tile_y, st_astext(geom) AS g FROM '__TEST_DIR__/rt.pmtiles'
+);
+----
+true
+
+query I
+SELECT count(*) = 0 FROM (
+    SELECT label, score, zoom, tile_x, tile_y, st_astext(geom) AS g FROM '__TEST_DIR__/rt.pmtiles'
+    EXCEPT
+    SELECT label, score, zoom, tile_x, tile_y, st_astext(geom) AS g FROM '__TEST_DIR__/rt.mbtiles'
+);
+----
+true
+
+# Zoom and layer parameters work the same way on a PMTiles archive.
+
+query II
+SELECT zoom, count(DISTINCT label) FROM read_pmtiles('__TEST_DIR__/rt.pmtiles', zoom := 12) GROUP BY 1;
+----
+12	2
+
+query I
+SELECT count(*) FROM read_pmtiles('__TEST_DIR__/rt.pmtiles', layer := 'nope');
+----
+0
+
+query I
+SELECT count(*) > 0 FROM read_pmtiles_tiles('__TEST_DIR__/rt.pmtiles');
+----
+true
+
+# Errors
+
+statement error
+SELECT * FROM read_mbtiles('__TEST_DIR__/does_not_exist.mbtiles');
+----
+Failed to open
+
+# Pointing the PMTiles reader at an mbtiles file is caught by the magic bytes.
+
+statement error
+SELECT * FROM read_pmtiles('__TEST_DIR__/rt.mbtiles');
+----
+is not a PMTiles archive
+
+statement error
+SELECT * FROM read_mbtiles('__TEST_DIR__/rt.mbtiles', nonsense := 1);
+----
+Invalid named parameter "nonsense" for function read_mbtiles
+
+statement error
+SELECT * FROM read_mbtiles('__TEST_DIR__/rt.mbtiles', zoom := 99);
+----
+ZOOM must be between 0 and 32

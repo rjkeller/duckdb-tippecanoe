@@ -1,0 +1,310 @@
+# name: test/sql/mbtiles.test
+# description: COPY ... TO '<file>.mbtiles' via tippecanoe
+# group: [tippecanoe]
+
+require tippecanoe
+
+statement ok
+PRAGMA enable_verification
+
+# The GeoJSON that gets piped into tippecanoe is observable via KEEP_GEOJSON,
+# which lets these tests assert on the conversion without opening a tileset.
+# Each assertion splits that file so that one feature is one result row.
+
+statement ok
+CREATE TABLE cities AS SELECT * FROM (VALUES
+    ('Amsterdam', 4.9041, 52.3676, 921402),
+    ('Berlin',   13.4050, 52.5200, 3645000)
+) t(name, lon, lat, population);
+
+statement ok
+COPY cities TO '__TEST_DIR__/cities.mbtiles'
+    (FORMAT mbtiles, KEEP_GEOJSON '__TEST_DIR__/cities.geojsonl');
+
+query I
+SELECT unnest(string_split(trim(content, E'\n'), E'\n')) FROM read_text('__TEST_DIR__/cities.geojsonl');
+----
+{"type":"Feature","geometry":{"type":"Point","coordinates":[4.9041,52.3676]},"properties":{"name":"Amsterdam","population":921402}}
+{"type":"Feature","geometry":{"type":"Point","coordinates":[13.405,52.52]},"properties":{"name":"Berlin","population":3645000}}
+
+# A GEOMETRY column is preferred over any longitude/latitude columns.
+
+statement ok
+COPY (SELECT 'LINESTRING(0 0, 1 1)'::GEOMETRY AS geom, 'a road' AS name)
+    TO '__TEST_DIR__/road.mbtiles'
+    (FORMAT mbtiles, KEEP_GEOJSON '__TEST_DIR__/road.geojsonl');
+
+query I
+SELECT unnest(string_split(trim(content, E'\n'), E'\n')) FROM read_text('__TEST_DIR__/road.geojsonl');
+----
+{"type":"Feature","geometry":{"type":"LineString","coordinates":[[0,0],[1,1]]},"properties":{"name":"a road"}}
+
+# Every WKB geometry type survives the conversion.
+
+statement ok
+COPY (SELECT * FROM (VALUES
+        ('POINT(1 2)'::GEOMETRY),
+        ('POLYGON((0 0, 1 0, 1 1, 0 0))'::GEOMETRY),
+        ('MULTIPOINT((1 2),(3 4))'::GEOMETRY),
+        ('MULTILINESTRING((0 0, 1 1))'::GEOMETRY),
+        ('MULTIPOLYGON(((0 0, 1 0, 1 1, 0 0)))'::GEOMETRY),
+        ('GEOMETRYCOLLECTION(POINT(1 2))'::GEOMETRY),
+        ('POINT Z (1 2 3)'::GEOMETRY)
+     ) t(geom))
+    TO '__TEST_DIR__/shapes.mbtiles'
+    (FORMAT mbtiles, KEEP_GEOJSON '__TEST_DIR__/shapes.geojsonl');
+
+query I
+SELECT unnest(string_split(trim(content, E'\n'), E'\n')) FROM read_text('__TEST_DIR__/shapes.geojsonl');
+----
+{"type":"Feature","geometry":{"type":"Point","coordinates":[1,2]},"properties":{}}
+{"type":"Feature","geometry":{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,0]]]},"properties":{}}
+{"type":"Feature","geometry":{"type":"MultiPoint","coordinates":[[1,2],[3,4]]},"properties":{}}
+{"type":"Feature","geometry":{"type":"MultiLineString","coordinates":[[[0,0],[1,1]]]},"properties":{}}
+{"type":"Feature","geometry":{"type":"MultiPolygon","coordinates":[[[[0,0],[1,0],[1,1],[0,0]]]]},"properties":{}}
+{"type":"Feature","geometry":{"type":"GeometryCollection","geometries":[{"type":"Point","coordinates":[1,2]}]},"properties":{}}
+{"type":"Feature","geometry":{"type":"Point","coordinates":[1,2,3]},"properties":{}}
+
+# An empty geometry becomes a null geometry rather than empty coordinates:
+# it has nothing to tile, and tippecanoe treats an empty Point as a hard error
+# that would otherwise fail the whole tileset over one row.
+
+statement ok
+COPY (SELECT * FROM (VALUES
+        ('POINT EMPTY'::GEOMETRY, 'p'),
+        ('LINESTRING EMPTY'::GEOMETRY, 'l'),
+        ('POLYGON EMPTY'::GEOMETRY, 'g'),
+        ('POINT(1 2)'::GEOMETRY, 'real')
+     ) t(geom, label))
+    TO '__TEST_DIR__/empty.mbtiles'
+    (FORMAT mbtiles, KEEP_GEOJSON '__TEST_DIR__/empty.geojsonl');
+
+query I
+SELECT unnest(string_split(trim(content, E'\n'), E'\n')) FROM read_text('__TEST_DIR__/empty.geojsonl');
+----
+{"type":"Feature","geometry":null,"properties":{"label":"p"}}
+{"type":"Feature","geometry":null,"properties":{"label":"l"}}
+{"type":"Feature","geometry":null,"properties":{"label":"g"}}
+{"type":"Feature","geometry":{"type":"Point","coordinates":[1,2]},"properties":{"label":"real"}}
+
+# NULL properties are dropped; a NULL geometry becomes a null feature geometry.
+
+statement ok
+COPY (SELECT * FROM (VALUES
+        ('POINT(1 2)'::GEOMETRY, NULL::VARCHAR, 7),
+        (NULL::GEOMETRY, 'kept', 8)
+     ) t(geom, label, n))
+    TO '__TEST_DIR__/nulls.mbtiles'
+    (FORMAT mbtiles, KEEP_GEOJSON '__TEST_DIR__/nulls.geojsonl');
+
+query I
+SELECT unnest(string_split(trim(content, E'\n'), E'\n')) FROM read_text('__TEST_DIR__/nulls.geojsonl');
+----
+{"type":"Feature","geometry":{"type":"Point","coordinates":[1,2]},"properties":{"n":7}}
+{"type":"Feature","geometry":null,"properties":{"label":"kept","n":8}}
+
+# ID_COLUMN is promoted out of the properties onto the feature itself.
+
+statement ok
+COPY (SELECT 42 AS fid, 'POINT(1 2)'::GEOMETRY AS geom, 'x' AS label)
+    TO '__TEST_DIR__/ids.mbtiles'
+    (FORMAT mbtiles, ID_COLUMN 'fid', KEEP_GEOJSON '__TEST_DIR__/ids.geojsonl');
+
+query I
+SELECT unnest(string_split(trim(content, E'\n'), E'\n')) FROM read_text('__TEST_DIR__/ids.geojsonl');
+----
+{"type":"Feature","id":42,"geometry":{"type":"Point","coordinates":[1,2]},"properties":{"label":"x"}}
+
+# Nested values become nested JSON, and strings are escaped.
+
+statement ok
+COPY (SELECT 'POINT(1 2)'::GEOMETRY AS geom,
+             ['a', 'b'] AS tags,
+             {'k': 1} AS meta,
+             DATE '2024-01-31' AS day,
+             1.25::DECIMAL(5,2) AS ratio,
+             E'quote:" backslash:\\ tab:\t' AS text)
+    TO '__TEST_DIR__/nested.mbtiles'
+    (FORMAT mbtiles, KEEP_GEOJSON '__TEST_DIR__/nested.geojsonl');
+
+query I
+SELECT unnest(string_split(trim(content, E'\n'), E'\n')) FROM read_text('__TEST_DIR__/nested.geojsonl');
+----
+{"type":"Feature","geometry":{"type":"Point","coordinates":[1,2]},"properties":{"tags":["a","b"],"meta":{"k":1},"day":"2024-01-31","ratio":1.25,"text":"quote:\" backslash:\\ tab:\t"}}
+
+# COORDINATE_PRECISION controls how many decimals reach tippecanoe.
+
+statement ok
+COPY (SELECT 'POINT(1.123456789 2.987654321)'::GEOMETRY AS geom)
+    TO '__TEST_DIR__/precision.mbtiles'
+    (FORMAT mbtiles, COORDINATE_PRECISION 3, KEEP_GEOJSON '__TEST_DIR__/precision.geojsonl');
+
+query I
+SELECT unnest(string_split(trim(content, E'\n'), E'\n')) FROM read_text('__TEST_DIR__/precision.geojsonl');
+----
+{"type":"Feature","geometry":{"type":"Point","coordinates":[1.123,2.988]},"properties":{}}
+
+# A negative precision keeps every digit.
+
+statement ok
+COPY (SELECT 'POINT(1.123456789 2.987654321)'::GEOMETRY AS geom)
+    TO '__TEST_DIR__/exact.mbtiles'
+    (FORMAT mbtiles, COORDINATE_PRECISION -1, KEEP_GEOJSON '__TEST_DIR__/exact.geojsonl');
+
+query I
+SELECT unnest(string_split(trim(content, E'\n'), E'\n')) FROM read_text('__TEST_DIR__/exact.geojsonl');
+----
+{"type":"Feature","geometry":{"type":"Point","coordinates":[1.123456789,2.987654321]},"properties":{}}
+
+# Explicitly named coordinate columns, including non-DOUBLE ones.
+
+statement ok
+COPY (SELECT 3::INTEGER AS a, 4::INTEGER AS b, 'here' AS label)
+    TO '__TEST_DIR__/lonlat.mbtiles'
+    (FORMAT mbtiles, LON 'a', LAT 'b', KEEP_GEOJSON '__TEST_DIR__/lonlat.geojsonl');
+
+query I
+SELECT unnest(string_split(trim(content, E'\n'), E'\n')) FROM read_text('__TEST_DIR__/lonlat.geojsonl');
+----
+{"type":"Feature","geometry":{"type":"Point","coordinates":[3,4]},"properties":{"label":"here"}}
+
+# A VARCHAR column of GeoJSON is passed through untouched.
+
+statement ok
+COPY (SELECT '{"type":"Point","coordinates":[5,6]}' AS geometry, 1 AS n)
+    TO '__TEST_DIR__/text.mbtiles'
+    (FORMAT mbtiles, KEEP_GEOJSON '__TEST_DIR__/text.geojsonl');
+
+query I
+SELECT unnest(string_split(trim(content, E'\n'), E'\n')) FROM read_text('__TEST_DIR__/text.geojsonl');
+----
+{"type":"Feature","geometry":{"type":"Point","coordinates":[5,6]},"properties":{"n":1}}
+
+# --read-parallel is on by default, so a pass-through GeoJSON column must never
+# introduce a line break: tippecanoe's parallel reader splits the stream on
+# newlines and would otherwise cut a feature in half.
+
+statement ok
+COPY (SELECT E'{\n  "type": "Point",\n  "coordinates": [5, 6]\n}' AS geometry, 1 AS n)
+    TO '__TEST_DIR__/multiline.mbtiles'
+    (FORMAT mbtiles, KEEP_GEOJSON '__TEST_DIR__/multiline.geojsonl');
+
+query I
+SELECT count(*) FROM read_text('__TEST_DIR__/multiline.geojsonl'),
+     unnest(string_split(trim(content, E'\n'), E'\n'));
+----
+1
+
+query I
+SELECT unnest(string_split(trim(content, E'\n'), E'\n')) FROM read_text('__TEST_DIR__/multiline.geojsonl');
+----
+{"type":"Feature","geometry":{   "type": "Point",   "coordinates": [5, 6] },"properties":{"n":1}}
+
+# The tile size and feature caps are lifted by default. This extract packs 60k
+# features into a small area, which produces a single tile of roughly 640 KB -
+# past tippecanoe's 500 KB cap.
+
+statement ok
+CREATE TABLE dense AS
+SELECT ('POINT(' || (1+(i%251)*0.002) || ' ' || (2+(i%253)*0.002) || ')')::GEOMETRY AS geom,
+       i, 'padding value for feature ' || i AS note
+FROM range(60000) t(i);
+
+statement ok
+COPY dense TO '__TEST_DIR__/dense.mbtiles' (FORMAT mbtiles, MAXZOOM 4);
+
+# Putting the caps back makes that same tileset abort, which is exactly what
+# the defaults are there to prevent.
+
+statement error
+COPY dense TO '__TEST_DIR__/dense2.mbtiles'
+    (FORMAT mbtiles, MAXZOOM 4, NO_TILE_SIZE_LIMIT false, NO_FEATURE_LIMIT false);
+----
+could not make tile
+
+# READ_PARALLEL can be turned off, and the tileset is unaffected either way.
+
+statement ok
+COPY cities TO '__TEST_DIR__/serial.mbtiles' (FORMAT mbtiles, MAXZOOM 2, READ_PARALLEL false);
+
+statement ok
+COPY cities TO '__TEST_DIR__/parallel.mbtiles' (FORMAT mbtiles, MAXZOOM 2, READ_PARALLEL true);
+
+# The written file really is an mbtiles tileset.
+
+statement ok
+COPY cities TO '__TEST_DIR__/verify.mbtiles' (FORMAT mbtiles, MAXZOOM 4, LAYER 'places');
+
+query I
+SELECT content[1:15] FROM read_blob('__TEST_DIR__/verify.mbtiles');
+----
+SQLite format 3
+
+# Overwriting an existing tileset routes the write through a "tmp_"-prefixed
+# file. The default layer name must still come from the name the user asked for.
+
+statement ok
+COPY (SELECT 'POINT(1 2)'::GEOMETRY AS geom, 'first' AS v) TO '__TEST_DIR__/layer.mbtiles'
+    (FORMAT mbtiles, MAXZOOM 1);
+
+statement ok
+COPY (SELECT 'POINT(9 9)'::GEOMETRY AS geom, 'second' AS v) TO '__TEST_DIR__/layer.mbtiles'
+    (FORMAT mbtiles, MAXZOOM 1);
+
+# Searched as hex so that the binary tileset never has to survive a UTF-8 cast.
+
+query II
+SELECT contains(hex(content), hex('"id":"layer"')),
+       contains(hex(content), hex('"id":"tmp_layer"'))
+FROM read_blob('__TEST_DIR__/layer.mbtiles');
+----
+true	false
+
+# Errors
+
+statement error
+COPY (SELECT 1 AS a, 2 AS b) TO '__TEST_DIR__/nogeom.mbtiles' (FORMAT mbtiles);
+----
+could not find a geometry
+
+# Options are validated against the list the extension declares, so DuckDB
+# rejects unknown ones before the bind ever runs.
+
+statement error
+COPY (SELECT 'POINT(1 2)'::GEOMETRY AS geom) TO '__TEST_DIR__/bad.mbtiles'
+    (FORMAT mbtiles, NOT_AN_OPTION 'x');
+----
+Unrecognized option "NOT_AN_OPTION" for mbtiles
+
+statement error
+COPY (SELECT 'POINT(1 2)'::GEOMETRY AS geom) TO '__TEST_DIR__/bad.mbtiles'
+    (FORMAT mbtiles, GEOMETRY_COLUMN 'missing');
+----
+which is not in the result
+
+statement error
+COPY (SELECT 'POINT(1 2)'::GEOMETRY AS geom) TO '__TEST_DIR__/bad.mbtiles'
+    (FORMAT mbtiles, LON 'geom');
+----
+must be given together
+
+statement error
+COPY (SELECT 1 AS n) TO '__TEST_DIR__/bad.mbtiles' (FORMAT mbtiles, GEOMETRY_COLUMN 'n');
+----
+cannot be used as a geometry
+
+# A tippecanoe that cannot be started is reported as such, not as a hang.
+
+statement error
+COPY (SELECT 'POINT(1 2)'::GEOMETRY AS geom) TO '__TEST_DIR__/bad.mbtiles'
+    (FORMAT mbtiles, TIPPECANOE '/nonexistent/tippecanoe');
+----
+Failed to start tippecanoe
+
+# tippecanoe's own failures surface with its message attached.
+
+statement error
+COPY (SELECT 'POINT(1 2)'::GEOMETRY AS geom) TO '__TEST_DIR__/bad.mbtiles'
+    (FORMAT mbtiles, ARGS ['--not-a-real-flag']);
+----
+tippecanoe
